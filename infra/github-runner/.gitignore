@@ -1,0 +1,6 @@
+# `aws cloudformation package` output: a rewritten copy of the template pointing at
+# an S3 object in your account. Build artifact, and account-specific.
+.packaged.yaml
+
+# Somewhere to keep real parameter values without committing them to a public fork.
+parameters.json

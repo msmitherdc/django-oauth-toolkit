@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Scale-to-zero GitHub Actions runner for the django-oauth-toolkit Oracle test job.
+  An HTTP API receives GitHub's workflow_job webhook, a Lambda mints a single-use
+  runner configuration and launches one Fargate task in the VPC that hosts the
+  Oracle RDS instance. The task runs one job and exits; no compute runs between
+  jobs.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: owner/repo whose queued jobs this stack serves, e.g. django-oauth/django-oauth-toolkit.
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+
+  RunnerLabel:
+    Type: String
+    Default: dot-oracle-rds
+    Description: >-
+      Custom runs-on label. Must match .github/workflows/test.yml. GitHub adds the
+      self-hosted/Linux/X64 defaults on top of it.
+
+  RunnerImageUri:
+    Type: String
+    Description: ECR image URI built from runner/Dockerfile, e.g. <acct>.dkr.ecr.us-east-1.amazonaws.com/dot-oracle-runner:1.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the Oracle RDS instance.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Subnets to run tasks in. They must reach both the RDS instance and the public
+      internet. Public subnets keep this free of NAT gateway charges, since tasks are
+      given a public IP; private subnets work too but need a NAT gateway, which bills
+      hourly whether or not a job is running.
+
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security group attached to the RDS instance. The stack adds one ingress rule to
+      it allowing the runner security group in on the Oracle port, and removes that
+      rule again on delete.
+
+  OraclePort:
+    Type: Number
+    Default: 1521
+    MinValue: 1
+    MaxValue: 65535
+
+  WebhookSecretArn:
+    Type: String
+    Description: Secrets Manager ARN of the GitHub webhook secret (a plaintext secret).
+
+  GitHubTokenSecretArn:
+    Type: String
+    Description: >-
+      Secrets Manager ARN of a plaintext token with Administration:write on the
+      repository, used only to mint just-in-time runner configurations.
+
+  TaskCpu:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["512", "1024", "2048", "4096", "8192", "16384"]
+
+  TaskMemory:
+    Type: String
+    Default: "4096"
+    Description: Must be a valid Fargate pairing for TaskCpu.
+
+  CapacityProvider:
+    Type: String
+    Default: FARGATE
+    AllowedValues: [FARGATE, FARGATE_SPOT]
+    Description: >-
+      FARGATE_SPOT is roughly 70% cheaper but a task can be reclaimed with two
+      minutes' notice, which fails the job mid-run.
+
+  DispatcherMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Reserved concurrency for the dispatcher, bounding the cost of unsigned traffic to its public URL.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} ephemeral GitHub Actions runners"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # Outbound to GitHub (job dispatch, checkout), PyPI, and the RDS endpoint.
+        # There is no inbound rule: nothing connects to a runner.
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Runner egress to GitHub, PyPI and the database
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+
+  RunnerToOracleIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref OraclePort
+      ToPort: !Ref OraclePort
+      SourceSecurityGroupId: !Ref RunnerSecurityGroup
+      Description: !Sub "${AWS::StackName} CI runners"
+
+  RunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${AWS::StackName}-runner"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # The runner itself needs no AWS permissions: the database credentials reach it as
+  # GitHub Actions secrets, not from this account.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      EphemeralStorage:
+        # Checkout, three tox virtualenvs and the setup-python download.
+        SizeInGiB: 30
+      ContainerDefinitions:
+        - Name: runner
+          Image: !Ref RunnerImageUri
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+          Environment:
+            - Name: RUNNER_MAX_SECONDS
+              Value: "7200"
+
+  DispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-dispatcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dispatch-runner-tasks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunRunnerTasksInThisClusterOnly
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-runner:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Sid: PassTheTaskRolesToEcsOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ReadTheWebhookAndTokenSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref WebhookSecretArn
+                  - !Ref GitHubTokenSecretArn
+
+  Dispatcher:
+    Type: AWS::Lambda::Function
+    DependsOn: DispatcherLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-dispatcher"
+      Description: Starts one ephemeral Fargate runner per queued GitHub Actions job.
+      Runtime: python3.12
+      Handler: webhook_dispatcher.handler
+      # `aws cloudformation package` uploads this directory and rewrites the property.
+      Code: lambda/
+      Role: !GetAtt DispatcherRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      # The function URL is public. A signature check is cheap and runs before
+      # anything else, but this bounds what a flood of unsigned requests can cost,
+      # and it is far more concurrency than real webhook traffic needs.
+      ReservedConcurrentExecutions: !Ref DispatcherMaxConcurrency
+      Environment:
+        Variables:
+          GITHUB_REPOSITORY: !Ref GitHubRepository
+          RUNNER_LABEL: !Ref RunnerLabel
+          ECS_CLUSTER: !Ref Cluster
+          ECS_TASK_DEFINITION: !Ref TaskDefinition
+          ECS_CONTAINER_NAME: runner
+          SUBNET_IDS: !Join [",", !Ref SubnetIds]
+          SECURITY_GROUP_IDS: !Ref RunnerSecurityGroup
+          CAPACITY_PROVIDER: !Ref CapacityProvider
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+          GITHUB_TOKEN_SECRET_ARN: !Ref GitHubTokenSecretArn
+
+  # A Lambda function URL rather than an API Gateway: this stack needs one HTTPS
+  # POST endpoint in front of one function, which is exactly what a function URL is,
+  # and it avoids standing up an API Gateway solely for this. The endpoint is
+  # unauthenticated because GitHub cannot sign requests with SigV4 -- the dispatcher
+  # authenticates every delivery itself, by HMAC, before it does any work.
+  WebhookUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Dispatcher.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  WebhookInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Dispatcher.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  WebhookUrl:
+    Description: Payload URL to configure on the GitHub repository webhook.
+    Value: !GetAtt WebhookUrl.FunctionUrl
+  RunnerSecurityGroupId:
+    Description: Security group the runner tasks use; allowed into the RDS security group on the Oracle port.
+    Value: !Ref RunnerSecurityGroup
+  ClusterName:
+    Value: !Ref Cluster
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  RunnerLogGroup:
+    Value: !Ref RunnerLogGroup
